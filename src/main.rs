@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod downloader;
+pub mod extractor;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -25,7 +26,7 @@ struct Cli {
     keywords: Vec<String>,
 
     /// Minimum package index (0-based, inclusive)
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 0)]
     min: usize,
 
     /// Maximum package index (0-based, exclusive)
@@ -47,11 +48,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
     tracing_subscriber::registry()
         .with(
             EnvFilter::from_env("RUST_LOG")
-                .add_directive(LevelFilter::DEBUG.into())
+                .add_directive(LevelFilter::INFO.into())
                 .add_directive(
                     "mago_database::utils=error"
                         .parse()
@@ -99,7 +99,6 @@ async fn main() -> Result<()> {
 
     let start_time = Instant::now();
 
-    // Download and extract packages
     if !cli.skip_download {
         tracing::info!(
             "Downloading packages {} to {} to {:?}",
@@ -109,10 +108,9 @@ async fn main() -> Result<()> {
         );
 
         let download_start = Instant::now();
-        let successful =
-            downloader::download_and_extract_packages(cli.directory.clone(), cli.min, cli.max)
-                .await
-                .context("Failed to download packages")?;
+        let successful = downloader::download_packages(cli.directory.clone(), cli.min, cli.max)
+            .await
+            .context("Failed to download packages")?;
 
         let download_duration = download_start.elapsed();
         tracing::info!(
@@ -124,7 +122,17 @@ async fn main() -> Result<()> {
         tracing::info!("Skipping download (--skip-download specified)");
     }
 
-    // Analyze the downloaded sources
+    let extract_start = Instant::now();
+    let extracted =
+        extractor::extract_packages(cli.directory.clone()).context("Failed to extract packages")?;
+
+    let extract_duration = extract_start.elapsed();
+    tracing::info!(
+        "Extracted {} packages in {:.2}s",
+        extracted,
+        extract_duration.as_secs_f64()
+    );
+
     let analysis_start = Instant::now();
     let sources_dir = cli.directory.join("sources");
 

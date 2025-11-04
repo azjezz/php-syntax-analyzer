@@ -44,26 +44,36 @@ pub fn analyze_directory(
     let database = loader.load()?;
     let files = database.files().collect::<Vec<_>>();
 
-    for keyword in keywords {
-        tracing::info!("Analyzing {} files for keyword '{keyword}'...", files.len());
+    tracing::info!(
+        "Analyzing {} files for {} keywords...",
+        files.len(),
+        keywords.len()
+    );
 
-        let issues: IssueCollection = files
-            .par_iter()
-            .map_init(Bump::new, |arena, file| {
-                Analyzer::run(arena, file, keyword.as_str())
-            })
-            .reduce(IssueCollection::new, |mut acc, coll| {
-                acc.extend(coll);
-                acc
-            });
+    let keyword_refs: Vec<&str> = keywords.iter().map(|s| s.as_str()).collect();
+    let all_issues: Vec<IssueCollection> = files
+        .par_iter()
+        .map_init(Bump::new, |arena, file| {
+            Analyzer::run(arena, file, &keyword_refs)
+        })
+        .collect();
 
-        let issue_count = issues.len();
+    // Separate issues by keyword
+    for keyword in &keywords {
+        let keyword_issues: IssueCollection = all_issues
+            .iter()
+            .flat_map(|issues| issues.iter())
+            .filter(|issue| issue.message.contains(&format!("keyword '{}'", keyword)))
+            .cloned()
+            .collect();
+
+        let issue_count = keyword_issues.len();
         if issue_count == 0 {
             tracing::info!("No issues found for keyword '{keyword}'.");
             continue;
         }
 
-        tracing::info!("Analysis complete for keyword '{keyword}'. Found {issue_count} issues.");
+        tracing::error!("Analysis complete for keyword '{keyword}'. Found {issue_count} issues.");
         if !display {
             continue;
         }
@@ -77,7 +87,7 @@ pub fn analyze_directory(
         );
 
         reporter
-            .report(issues, ReportingFormat::Rich)
+            .report(keyword_issues, ReportingFormat::Rich)
             .expect("Failed to report issues");
     }
 
@@ -86,16 +96,20 @@ pub fn analyze_directory(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Analyzer<'ctx> {
-    keyword: &'ctx str,
+    keywords: &'ctx [&'ctx str],
 }
 
 impl<'ctx> Analyzer<'ctx> {
-    pub fn run<'arena>(arena: &'arena Bump, file: &File, keyword: &'ctx str) -> IssueCollection {
+    pub fn run<'arena>(
+        arena: &'arena Bump,
+        file: &File,
+        keywords: &'ctx [&'ctx str],
+    ) -> IssueCollection {
         let (program, _) = parse_file(arena, file);
 
         let resolved_names = NameResolver::new(arena).resolve(program);
         let mut ctx = AnalysisContext::new(arena, file, program, resolved_names);
-        let analyzer = Analyzer { keyword };
+        let analyzer = Analyzer { keywords };
         analyzer.walk_program(program, &mut ctx);
         ctx.collector.finish()
     }
@@ -132,17 +146,20 @@ impl<'ctx, 'ast, 'arena> Walker<'ast, 'arena, AnalysisContext<'ctx, 'arena>> for
 
         let resolved_name = ctx.resolved_names.get(identifier);
 
-        let last_segment = resolved_name.split('\\').last().unwrap_or_default();
-        if !last_segment.eq_ignore_ascii_case(&self.keyword) {
-            return;
-        }
+        let last_segment = resolved_name.split('\\').next_back().unwrap_or_default();
 
-        ctx.collector.report(
-            Issue::error("Found usage of target keyword").with_annotation(
-                Annotation::primary(identifier.span())
-                    .with_message(format!("Call to function `{resolved_name}` found here")),
-            ),
-        );
+        for &keyword in self.keywords {
+            if last_segment.eq_ignore_ascii_case(keyword) {
+                ctx.collector.report(
+                    Issue::error(format!("Found usage of target keyword '{}'", keyword))
+                        .with_annotation(Annotation::primary(identifier.span()).with_message(
+                            format!("Call to function `{resolved_name}` found here"),
+                        )),
+                );
+
+                break;
+            }
+        }
     }
 
     fn walk_in_function_closure_creation(
@@ -155,18 +172,20 @@ impl<'ctx, 'ast, 'arena> Walker<'ast, 'arena, AnalysisContext<'ctx, 'arena>> for
         };
 
         let resolved_name = context.resolved_names.get(identifier);
-        let last_segment = resolved_name.split('\\').last().unwrap_or_default();
-        if !last_segment.eq_ignore_ascii_case(self.keyword) {
-            return;
-        }
+        let last_segment = resolved_name.split('\\').next_back().unwrap_or_default();
 
-        context.collector.report(
-            Issue::error("Found usage of target keyword").with_annotation(
-                Annotation::primary(identifier.span()).with_message(format!(
-                    "Function closure creation for `{resolved_name}` found here"
-                )),
-            ),
-        );
+        for &keyword in self.keywords {
+            if last_segment.eq_ignore_ascii_case(keyword) {
+                context.collector.report(
+                    Issue::error(format!("Found usage of target keyword '{}'", keyword))
+                        .with_annotation(Annotation::primary(identifier.span()).with_message(
+                            format!("Function closure creation for `{resolved_name}` found here"),
+                        )),
+                );
+
+                break;
+            }
+        }
     }
 
     fn walk_in_function(
@@ -175,22 +194,25 @@ impl<'ctx, 'ast, 'arena> Walker<'ast, 'arena, AnalysisContext<'ctx, 'arena>> for
         context: &mut AnalysisContext<'ctx, 'arena>,
     ) {
         let name = &function.name.value;
-        if !name.eq_ignore_ascii_case(self.keyword) {
-            return;
+
+        for &keyword in self.keywords {
+            if name.eq_ignore_ascii_case(keyword) {
+                let fqn = context.resolved_names.get(&function.name);
+
+                context.collector.report(
+                    Issue::error(format!("Found usage of target keyword '{}'", keyword))
+                        .with_annotation(
+                            Annotation::primary(function.name.span())
+                                .with_message(format!("Function `{name}` found here")),
+                        )
+                        .with_annotation(
+                            Annotation::secondary(function.span())
+                                .with_message(format!("Function `{fqn}` defined here")),
+                        ),
+                );
+
+                break;
+            }
         }
-
-        let fqn = context.resolved_names.get(&function.name);
-
-        context.collector.report(
-            Issue::error("Found usage of target keyword")
-                .with_annotation(
-                    Annotation::primary(function.name.span())
-                        .with_message(format!("Function `{name}` found here")),
-                )
-                .with_annotation(
-                    Annotation::secondary(function.span())
-                        .with_message(format!("Function `{fqn}` defined here")),
-                ),
-        );
     }
 }
