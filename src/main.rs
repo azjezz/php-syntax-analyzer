@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
         .with(
             fmt::layer()
                 .without_time()
-                .with_target(true)
+                .with_target(false)
                 .with_thread_ids(false)
                 .with_level(true),
         )
