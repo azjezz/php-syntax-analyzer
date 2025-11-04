@@ -1,0 +1,6 @@
+[32m INFO[0m Skipping download (--skip-download specified)
+[32m INFO[0m Analyzing PHP source code for keyword: let
+[32m INFO[0m Starting analysis for keyword 'let' in directory "downloads"
+[32m INFO[0m Analyzing 32124 files...
+[32m INFO[0m Analysis completed in 1.42s
+[32m INFO[0m Total time: 1.42s
