@@ -1,29 +1,31 @@
-pub mod analyzer;
-pub mod downloader;
-pub mod extractor;
-
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use clap::Parser;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_indicatif::IndicatifLayer;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt;
+use tracing_subscriber::prelude::*;
 
 use analyzer::analyze_directory;
 
+mod analyzer;
+mod downloader;
+mod extractor;
+mod files;
+mod results;
+
 #[derive(Parser)]
-#[command(name = "php-syntax-analyzer")]
+#[command(name = "keyword-impact-analyzer")]
 #[command(version = "0.1.0")]
-#[command(about = "Analyze PHP packages for keyword usage to assess impact of making keywords reserved", long_about = None)]
+#[command(about = "Analyze keyword impact across PHP packages for RFC authors", long_about = None)]
 struct Cli {
-    /// Target keyword to analyze (let, scope, or using)
-    #[arg(
-        short,
-        long,
-        help = "Target keyword to analyze (e.g, let, scope, or using)"
-    )]
-    keywords: Vec<String>,
+    /// Keywords to analyze (can be specified multiple times)
+    #[arg(short, long, required = true)]
+    keyword: Vec<String>,
 
     /// Minimum package index (0-based, inclusive)
     #[arg(long, default_value_t = 0)]
@@ -33,22 +35,21 @@ struct Cli {
     #[arg(long, default_value_t = 500)]
     max: usize,
 
-    /// Directory to download packages to (analysis will run on sources subdirectory)
+    /// Download directory
     #[arg(short, long, default_value = "downloads")]
     directory: PathBuf,
 
-    /// Skip downloading packages (analyze existing sources only)
-    #[arg(long, default_value_t = false)]
+    /// Skip download phase (analyze existing sources only)
+    #[arg(long)]
     skip_download: bool,
-
-    /// Display found issues
-    #[arg(long, default_value_t = false)]
-    display: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let indicatif_layer = IndicatifLayer::new();
+
     tracing_subscriber::registry()
+        .with(indicatif_layer)
         .with(
             EnvFilter::from_env("RUST_LOG")
                 .add_directive(LevelFilter::INFO.into())
@@ -89,8 +90,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    if cli.keywords.is_empty() {
-        anyhow::bail!("At least one keyword must be specified using --keywords");
+    if cli.keyword.is_empty() {
+        anyhow::bail!("At least one keyword must be specified using --keyword");
     }
 
     if cli.min >= cli.max {
@@ -108,9 +109,20 @@ async fn main() -> Result<()> {
         );
 
         let download_start = Instant::now();
-        let successful = downloader::download_packages(cli.directory.clone(), cli.min, cli.max)
-            .await
-            .context("Failed to download packages")?;
+        let (successful, failed) =
+            downloader::download_packages(cli.directory.clone(), cli.min, cli.max)
+                .await
+                .context("Failed to download packages")?;
+
+        if failed > 0 {
+            tracing::warn!(
+                "Download complete: {} successful, {} failed",
+                successful,
+                failed
+            );
+        } else {
+            tracing::info!("All {} packages downloaded successfully", successful);
+        }
 
         let download_duration = download_start.elapsed();
         tracing::info!(
@@ -143,8 +155,8 @@ async fn main() -> Result<()> {
         );
     }
 
-    analyze_directory(cli.directory, sources_dir, cli.keywords, cli.display)
-        .context("Failed to analyze directory")?;
+    let report =
+        analyze_directory(sources_dir, cli.keyword).context("Failed to analyze directory")?;
 
     let analysis_duration = analysis_start.elapsed();
     tracing::info!(
@@ -154,6 +166,8 @@ async fn main() -> Result<()> {
 
     let total_duration = start_time.elapsed();
     tracing::info!("Total time: {:.2}s", total_duration.as_secs_f64());
+
+    report.display_table();
 
     Ok(())
 }

@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde::Deserialize;
 
 const PACKAGIST_PER_PAGE: usize = 15;
-const MAX_CONCURRENT_DOWNLOADS: usize = 5000;
+const MAX_CONCURRENT_DOWNLOADS: usize = 500;
 
 #[derive(Debug, Deserialize)]
 struct PackageListResponse {
@@ -35,7 +35,7 @@ struct DistInfo {
     url: String,
 }
 
-/// Fetches top packages from Packagist
+#[tracing::instrument(name = "fetching-package-list-from-packagist", skip(client))]
 async fn get_top_packages(client: &Client, min: usize, max: usize) -> Result<Vec<String>> {
     let mut packages = Vec::new();
     let mut page = (min / PACKAGIST_PER_PAGE) + 1;
@@ -78,20 +78,18 @@ async fn get_top_packages(client: &Client, min: usize, max: usize) -> Result<Vec
     }
 }
 
-/// Downloads a single package
+#[tracing::instrument(name = "downloading-package", skip(client, target_dir))]
 async fn download_package(client: &Client, package_name: &str, target_dir: &Path) -> Result<()> {
     let package_name_lower = package_name.to_lowercase();
 
     tracing::debug!("Processing package: {}", package_name);
 
-    // Split package name into vendor and package for v2 API
     let parts: Vec<&str> = package_name_lower.split('/').collect();
     if parts.len() != 2 {
         anyhow::bail!("Invalid package name format: {}", package_name);
     }
     let (vendor, package) = (parts[0], parts[1]);
 
-    // Fetch package metadata using v2 API
     let metadata_url = format!("https://repo.packagist.org/p2/{}/{}.json", vendor, package);
 
     let response = client
@@ -123,13 +121,11 @@ async fn download_package(client: &Client, package_name: &str, target_dir: &Path
         .as_ref()
         .context("No dist information available")?;
 
-    // Create directory structure
     let zipball_dir = target_dir.join("zipballs").join(&package_name_lower);
     fs::create_dir_all(&zipball_dir).context("Failed to create zipball directory")?;
 
     let zipball_path = zipball_dir.join(format!("{}.zip", package_name_lower.replace('/', "-")));
 
-    // Skip if already downloaded
     if zipball_path.exists() {
         tracing::debug!("Package {} already downloaded, skipping", package_name);
         return Ok(());
@@ -155,23 +151,22 @@ async fn download_package(client: &Client, package_name: &str, target_dir: &Path
     Ok(())
 }
 
-/// Downloads packages from Packagist
-pub async fn download_packages(target_dir: PathBuf, min: usize, max: usize) -> Result<usize> {
-    // Create necessary directories
+#[tracing::instrument(name = "downloading-packages")]
+pub async fn download_packages(
+    target_dir: PathBuf,
+    min: usize,
+    max: usize,
+) -> Result<(usize, usize)> {
     fs::create_dir_all(target_dir.join("zipballs"))
         .context("Failed to create zipballs directory")?;
 
     let client = Client::builder()
-        .user_agent("php-syntax-analyzer/0.1.0")
+        .user_agent("keyword-impact-analyzer/1.0.0")
         .build()
         .context("Failed to create HTTP client")?;
 
-    // Fetch list of top packages
     let packages = get_top_packages(&client, min, max).await?;
 
-    tracing::info!("Downloading {} packages...", packages.len());
-
-    // Download packages concurrently
     let mut successful = 0;
     let mut failed = 0;
 
@@ -182,10 +177,7 @@ pub async fn download_packages(target_dir: PathBuf, min: usize, max: usize) -> R
             async move {
                 match download_package(&client, &package_name, &target_dir).await {
                     Ok(_) => Ok(()),
-                    Err(e) => {
-                        tracing::warn!("Failed to download {}: {}", package_name, e);
-                        Err(())
-                    }
+                    Err(e) => Err((package_name, e)),
                 }
             }
         })
@@ -196,19 +188,13 @@ pub async fn download_packages(target_dir: PathBuf, min: usize, max: usize) -> R
     for result in results {
         match result {
             Ok(_) => successful += 1,
-            Err(_) => failed += 1,
+            Err((package_name, e)) => {
+                tracing::warn!("Failed to download {package_name}: {e}");
+
+                failed += 1;
+            }
         }
     }
 
-    if failed > 0 {
-        tracing::warn!(
-            "Download complete: {} successful, {} failed",
-            successful,
-            failed
-        );
-    } else {
-        tracing::info!("All {} packages downloaded successfully", successful);
-    }
-
-    Ok(successful)
+    Ok((successful, failed))
 }

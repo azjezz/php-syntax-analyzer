@@ -7,7 +7,7 @@ use anyhow::Context;
 use anyhow::Result;
 use rayon::prelude::*;
 
-/// Extracts a zip file and flattens the directory structure
+#[tracing::instrument(name = "extracting-zip", skip(extract_to))]
 fn extract_zip(zip_path: &Path, extract_to: &Path) -> Result<()> {
     let file = fs::File::open(zip_path).context("Failed to open zip file")?;
     let mut archive = zip::ZipArchive::new(file).context("Failed to read zip archive")?;
@@ -48,7 +48,7 @@ fn extract_zip(zip_path: &Path, extract_to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Extracts all zipballs in parallel using rayon
+#[tracing::instrument(name = "extracting-packages")]
 pub fn extract_packages(target_dir: PathBuf) -> Result<usize> {
     let zipballs_dir = target_dir.join("zipballs");
     let sources_dir = target_dir.join("sources");
@@ -94,7 +94,8 @@ pub fn extract_packages(target_dir: PathBuf) -> Result<usize> {
         match result {
             Ok(_) => successful += 1,
             Err(e) => {
-                tracing::warn!("Failed to extract package: {}", e);
+                tracing::warn!("{}", e);
+
                 failed += 1;
             }
         }

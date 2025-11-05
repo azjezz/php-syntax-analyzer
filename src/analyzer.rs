@@ -1,161 +1,113 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::Result;
 use bumpalo::Bump;
 use rayon::prelude::*;
 
-use mago_collector::Collector;
-use mago_database::DatabaseReader;
-use mago_database::error::DatabaseError;
-use mago_database::file::File;
-use mago_database::loader::DatabaseLoader;
 use mago_names::ResolvedNames;
 use mago_names::resolver::NameResolver;
-use mago_reporting::Annotation;
-use mago_reporting::ColorChoice;
-use mago_reporting::Issue;
-use mago_reporting::IssueCollection;
-use mago_reporting::reporter::Reporter;
-use mago_reporting::reporter::ReportingFormat;
-use mago_reporting::reporter::ReportingTarget;
-use mago_span::HasSpan;
+use mago_span::HasPosition;
 use mago_syntax::ast::*;
 use mago_syntax::parser::parse_file;
 use mago_syntax::walker::Walker;
 
+use crate::files::{read_file, walk_files};
+use crate::results::{AnalysisReport, Match, Vendor};
+
+#[tracing::instrument(name = "analyzing-directory")]
 pub fn analyze_directory(
-    donwload_directory: PathBuf,
     sources_directory: PathBuf,
     keywords: Vec<String>,
-    display: bool,
-) -> Result<(), DatabaseError> {
-    tracing::info!(
-        "Starting analysis for keywords '{:?}' in directory {:?}",
-        keywords,
-        donwload_directory
-    );
+) -> Result<AnalysisReport> {
+    tracing::info!("Starting analysis...");
 
-    let loader = DatabaseLoader::new(
-        donwload_directory.canonicalize()?,
-        vec![sources_directory.canonicalize()?],
-        vec![],
-        vec![],
-        vec!["php".to_string(), "php7".to_string(), "php8".to_string()],
-    );
-    let database = loader.load()?;
-    let files = database.files().collect::<Vec<_>>();
-
-    tracing::info!(
-        "Analyzing {} files for {} keywords...",
-        files.len(),
-        keywords.len()
-    );
+    let sources_canonical = sources_directory.canonicalize()?;
 
     let keyword_refs: Vec<&str> = keywords.iter().map(|s| s.as_str()).collect();
-    let all_issues: Vec<IssueCollection> = files
-        .par_iter()
+    let all_matches: Vec<Vec<Match>> = walk_files(&sources_canonical)
         .map_init(Bump::new, |arena, file| {
-            Analyzer::run(arena, file, &keyword_refs)
+            Analyzer::run(arena, &file, &sources_canonical, &keyword_refs)
         })
         .collect();
 
-    // Separate issues by keyword
-    for keyword in &keywords {
-        let keyword_issues: IssueCollection = all_issues
-            .iter()
-            .flat_map(|issues| issues.iter())
-            .filter(|issue| issue.message.contains(&format!("keyword '{}'", keyword)))
-            .cloned()
-            .collect();
+    tracing::info!("Collected matches from {} files.", all_matches.len());
 
-        let issue_count = keyword_issues.len();
-        if issue_count == 0 {
-            tracing::info!("No issues found for keyword '{keyword}'.");
-            continue;
-        }
+    let mut report = AnalysisReport::new(all_matches.len());
+    let matches: Vec<Match> = all_matches.into_iter().flatten().collect();
+    report.add_matches(matches);
+    report.ensure_all_keywords(&keywords);
 
-        tracing::error!("Analysis complete for keyword '{keyword}'. Found {issue_count} issues.");
-        if !display {
-            continue;
-        }
+    tracing::info!("Analysis complete.");
 
-        let reporter = Reporter::new(
-            database.read_only(),
-            ReportingTarget::Stdout,
-            ColorChoice::Always,
-            false,
-            None,
-        );
-
-        reporter
-            .report(keyword_issues, ReportingFormat::Rich)
-            .expect("Failed to report issues");
-    }
-
-    Ok(())
+    Ok(report)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Analyzer<'ctx> {
+    hard: bool,
     keywords: &'ctx [&'ctx str],
 }
 
 impl<'ctx> Analyzer<'ctx> {
+    #[tracing::instrument(name = "analyzing-file", skip(arena, sources_canonical, keywords))]
     pub fn run<'arena>(
         arena: &'arena Bump,
-        file: &File,
+        file: &Path,
+        sources_canonical: &Path,
         keywords: &'ctx [&'ctx str],
-    ) -> IssueCollection {
-        let (program, _) = parse_file(arena, file);
+    ) -> Vec<Match> {
+        let Some((vendor, file)) = read_file(file, sources_canonical) else {
+            return Vec::with_capacity(0);
+        };
 
+        let (program, _) = parse_file(arena, &file);
         let resolved_names = NameResolver::new(arena).resolve(program);
-        let mut ctx = AnalysisContext::new(arena, file, program, resolved_names);
-        let analyzer = Analyzer { keywords };
+        let mut ctx = AnalysisContext::new(vendor, resolved_names);
+        let analyzer = Analyzer {
+            hard: true,
+            keywords,
+        };
         analyzer.walk_program(program, &mut ctx);
-        ctx.collector.finish()
+        ctx.matches
     }
 }
 
-pub struct AnalysisContext<'ctx, 'arena> {
+pub struct AnalysisContext<'arena> {
+    vendor: Vendor,
     resolved_names: ResolvedNames<'arena>,
-    collector: Collector<'ctx, 'arena>,
+    matches: Vec<Match>,
 }
 
-impl<'ctx, 'arena> AnalysisContext<'ctx, 'arena> {
-    pub fn new<'ast>(
-        arena: &'arena Bump,
-        file: &'ctx File,
-        program: &'ast Program<'arena>,
-        resolved_names: ResolvedNames<'arena>,
-    ) -> Self {
+impl<'arena> AnalysisContext<'arena> {
+    pub fn new(vendor: Vendor, resolved_names: ResolvedNames<'arena>) -> Self {
         Self {
+            vendor,
             resolved_names,
-            collector: Collector::new(arena, file, program, &[]),
+            matches: Vec::new(),
         }
     }
 }
 
-impl<'ctx, 'ast, 'arena> Walker<'ast, 'arena, AnalysisContext<'ctx, 'arena>> for Analyzer<'ctx> {
+impl<'ctx, 'ast, 'arena> Walker<'ast, 'arena, AnalysisContext<'arena>> for Analyzer<'ctx> {
     fn walk_in_function_call(
         &self,
         function_call: &'ast FunctionCall<'arena>,
-        ctx: &mut AnalysisContext<'ctx, 'arena>,
+        ctx: &mut AnalysisContext<'arena>,
     ) {
         let Expression::Identifier(identifier) = function_call.function else {
             return;
         };
 
         let resolved_name = ctx.resolved_names.get(identifier);
-
         let last_segment = resolved_name.split('\\').next_back().unwrap_or_default();
 
         for &keyword in self.keywords {
             if last_segment.eq_ignore_ascii_case(keyword) {
-                ctx.collector.report(
-                    Issue::error(format!("Found usage of target keyword '{}'", keyword))
-                        .with_annotation(Annotation::primary(identifier.span()).with_message(
-                            format!("Call to function `{resolved_name}` found here"),
-                        )),
-                );
+                ctx.matches.push(Match {
+                    keyword: keyword.to_string(),
+                    vendor: ctx.vendor,
+                    is_hard: false,
+                });
 
                 break;
             }
@@ -165,7 +117,7 @@ impl<'ctx, 'ast, 'arena> Walker<'ast, 'arena, AnalysisContext<'ctx, 'arena>> for
     fn walk_in_function_closure_creation(
         &self,
         function_closure_creation: &'ast FunctionClosureCreation<'arena>,
-        context: &mut AnalysisContext<'ctx, 'arena>,
+        context: &mut AnalysisContext<'arena>,
     ) {
         let Expression::Identifier(identifier) = function_closure_creation.function else {
             return;
@@ -176,12 +128,11 @@ impl<'ctx, 'ast, 'arena> Walker<'ast, 'arena, AnalysisContext<'ctx, 'arena>> for
 
         for &keyword in self.keywords {
             if last_segment.eq_ignore_ascii_case(keyword) {
-                context.collector.report(
-                    Issue::error(format!("Found usage of target keyword '{}'", keyword))
-                        .with_annotation(Annotation::primary(identifier.span()).with_message(
-                            format!("Function closure creation for `{resolved_name}` found here"),
-                        )),
-                );
+                context.matches.push(Match {
+                    keyword: keyword.to_string(),
+                    vendor: context.vendor,
+                    is_hard: false,
+                });
 
                 break;
             }
@@ -191,25 +142,101 @@ impl<'ctx, 'ast, 'arena> Walker<'ast, 'arena, AnalysisContext<'ctx, 'arena>> for
     fn walk_in_function(
         &self,
         function: &'ast Function<'arena>,
-        context: &mut AnalysisContext<'ctx, 'arena>,
+        context: &mut AnalysisContext<'arena>,
     ) {
         let name = &function.name.value;
 
         for &keyword in self.keywords {
             if name.eq_ignore_ascii_case(keyword) {
-                let fqn = context.resolved_names.get(&function.name);
+                context.matches.push(Match {
+                    keyword: keyword.to_string(),
+                    vendor: context.vendor,
+                    is_hard: false,
+                });
 
-                context.collector.report(
-                    Issue::error(format!("Found usage of target keyword '{}'", keyword))
-                        .with_annotation(
-                            Annotation::primary(function.name.span())
-                                .with_message(format!("Function `{name}` found here")),
-                        )
-                        .with_annotation(
-                            Annotation::secondary(function.span())
-                                .with_message(format!("Function `{fqn}` defined here")),
-                        ),
-                );
+                break;
+            }
+        }
+    }
+
+    fn walk_in_local_identifier(
+        &self,
+        local_identifier: &'ast LocalIdentifier<'arena>,
+        context: &mut AnalysisContext<'arena>,
+    ) {
+        if !self.hard {
+            return;
+        }
+
+        for &keyword in self.keywords {
+            if local_identifier.value.eq_ignore_ascii_case(keyword) {
+                context.matches.push(Match {
+                    keyword: keyword.to_string(),
+                    vendor: context.vendor,
+                    is_hard: true,
+                });
+
+                break;
+            }
+        }
+    }
+
+    fn walk_in_qualified_identifier(
+        &self,
+        qualified_identifier: &'ast QualifiedIdentifier<'arena>,
+        context: &mut AnalysisContext<'arena>,
+    ) {
+        if !self.hard {
+            return;
+        }
+
+        let position = qualified_identifier.position();
+        if !context.resolved_names.contains(&position) {
+            return;
+        }
+
+        let last_segment = context
+            .resolved_names
+            .get(&position)
+            .split('\\')
+            .next_back()
+            .unwrap_or_default();
+
+        for &keyword in self.keywords {
+            if last_segment.eq_ignore_ascii_case(keyword) {
+                context.matches.push(Match {
+                    keyword: keyword.to_string(),
+                    vendor: context.vendor,
+                    is_hard: true,
+                });
+
+                break;
+            }
+        }
+    }
+
+    fn walk_in_fully_qualified_identifier(
+        &self,
+        fully_qualified_identifier: &'ast FullyQualifiedIdentifier<'arena>,
+        context: &mut AnalysisContext<'arena>,
+    ) {
+        if !self.hard {
+            return;
+        }
+
+        let last_segment = fully_qualified_identifier
+            .value
+            .split('\\')
+            .next_back()
+            .unwrap_or_default();
+
+        for &keyword in self.keywords {
+            if last_segment.eq_ignore_ascii_case(keyword) {
+                context.matches.push(Match {
+                    keyword: keyword.to_string(),
+                    vendor: context.vendor,
+                    is_hard: true,
+                });
 
                 break;
             }
