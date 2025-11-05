@@ -66,7 +66,7 @@ Results are displayed as a table:
 - **Low**: 1-25 occurrences
 - **Medium**: 26-100 occurrences
 - **High**: 101-500 occurrences
-- **Extreme**: 501+
+- **Critical**: 501+
 
 ⚠️ **Warning**: Analysis of fewer than 200,000 files will show a warning recommending increasing `--max` for comprehensive results.
 
@@ -88,4 +88,4 @@ To add analysis for a new RFC:
 
 ## License
 
-MIT
+This project is distributed under the MIT License. See [`LICENSE`](./LICENSE) for more information.
