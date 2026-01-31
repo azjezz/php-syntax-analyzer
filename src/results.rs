@@ -50,10 +50,17 @@ impl Vendor {
 }
 
 #[derive(Debug, Clone)]
-pub struct Match {
+pub struct KeywordMatch {
     pub keyword: String,
     pub vendor: Vendor,
     pub is_hard: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LabelMatch {
+    // todo: this sohuld be &'arena str, no need to re-allocate
+    pub label: String,
+    pub vendor: Vendor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -94,6 +101,12 @@ pub struct KeywordResult {
     pub well_known_vendors: HashSet<Vendor>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LabelResult {
+    pub count: usize,
+    pub well_known_vendors: HashSet<Vendor>,
+}
+
 impl KeywordResult {
     pub fn new() -> Self {
         Self {
@@ -115,7 +128,7 @@ impl KeywordResult {
         ImpactLevel::calculate(self.total_count())
     }
 
-    pub fn add_match(&mut self, m: &Match) {
+    pub fn add_match(&mut self, m: &KeywordMatch) {
         if m.is_hard {
             self.hard_count += 1;
         } else {
@@ -128,32 +141,59 @@ impl KeywordResult {
     }
 }
 
+impl LabelResult {
+    pub fn new() -> Self {
+        Self {
+            count: 0,
+            well_known_vendors: HashSet::new(),
+        }
+    }
+
+    pub fn add_match(&mut self, m: &LabelMatch) {
+        self.count += 1;
+        if m.vendor.is_well_known() {
+            self.well_known_vendors.insert(m.vendor);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AnalysisReport {
-    pub results: HashMap<String, KeywordResult>,
+    pub keyword_results: HashMap<String, KeywordResult>,
+    pub label_results: HashMap<String, LabelResult>,
     pub total_files: usize,
 }
 
 impl AnalysisReport {
     pub fn new(total_files: usize) -> Self {
         Self {
-            results: HashMap::new(),
+            keyword_results: HashMap::new(),
+            label_results: HashMap::new(),
             total_files,
         }
     }
 
-    pub fn add_matches(&mut self, matches: Vec<Match>) {
+    pub fn add_keyword_matches(&mut self, matches: Vec<KeywordMatch>) {
         for m in matches {
-            self.results
+            self.keyword_results
                 .entry(m.keyword.clone())
                 .or_insert_with(KeywordResult::new)
                 .add_match(&m);
         }
     }
 
+    pub fn add_label_matches(&mut self, matches: Vec<LabelMatch>) {
+        for m in matches {
+            self.label_results
+                .entry(m.label.clone())
+                .or_insert_with(LabelResult::new)
+                .add_match(&m);
+        }
+    }
+
     pub fn ensure_all_keywords(&mut self, keywords: &[String]) {
         for keyword in keywords {
-            self.results
+            self.keyword_results
                 .entry(keyword.clone())
                 .or_insert_with(KeywordResult::new);
         }
@@ -225,7 +265,7 @@ impl AnalysisReport {
         }
     }
 
-    pub fn display_table(&self) {
+    pub fn display_table(&self, show_keywords: bool, show_labels: bool) {
         if self.should_warn_low_file_count() {
             eprintln!(
                 "\n⚠️  WARNING: Only analyzed {} files (less than 200,000 recommended)",
@@ -236,55 +276,105 @@ impl AnalysisReport {
             );
         }
 
-        let mut keyword_data: Vec<_> = self
-            .results
-            .iter()
-            .map(|(keyword, result)| {
-                let soft_impact = result.soft_impact();
-                let hard_impact = result.hard_impact();
-                (keyword.clone(), result, soft_impact, hard_impact)
-            })
-            .collect();
+        if show_keywords {
+            let mut keyword_data: Vec<_> = self
+                .keyword_results
+                .iter()
+                .map(|(keyword, result)| {
+                    let soft_impact = result.soft_impact();
+                    let hard_impact = result.hard_impact();
+                    (keyword.clone(), result, soft_impact, hard_impact)
+                })
+                .collect();
 
-        keyword_data.sort_by(|a, b| {
-            b.3.cmp(&a.3)
-                .then_with(|| b.1.total_count().cmp(&a.1.total_count()))
-                .then_with(|| a.0.cmp(&b.0))
-        });
+            if keyword_data.is_empty() {
+                tracing::info!("No keywords match found in the analyzed packages.");
+                return;
+            }
 
-        let mut rows = Vec::new();
-        for (keyword, result, soft_impact, hard_impact) in keyword_data {
-            let well_known_str = if result.well_known_vendors.is_empty() {
-                "-".to_string()
-            } else {
-                let mut vendors: Vec<_> = result
-                    .well_known_vendors
-                    .iter()
-                    .map(|v| v.as_str().trim_end_matches('/'))
-                    .collect();
-                vendors.sort();
-                Self::wrap_text(&vendors.join(", "), 60)
-            };
+            keyword_data.sort_by(|a, b| {
+                b.3.cmp(&a.3)
+                    .then_with(|| b.1.total_count().cmp(&a.1.total_count()))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
 
-            rows.push(vec![
-                keyword.cell().bold(true),
-                result.soft_count.cell().justify(Justify::Right),
-                result.hard_count.cell().justify(Justify::Right),
-                Self::create_impact_cell(soft_impact),
-                Self::create_impact_cell(hard_impact),
-                well_known_str.cell(),
+            let mut keyboard_rows = Vec::new();
+            for (keyword, result, soft_impact, hard_impact) in keyword_data {
+                let well_known_str = if result.well_known_vendors.is_empty() {
+                    "-".to_string()
+                } else {
+                    let mut vendors: Vec<_> = result
+                        .well_known_vendors
+                        .iter()
+                        .map(|v| v.as_str().trim_end_matches('/'))
+                        .collect();
+                    vendors.sort();
+                    Self::wrap_text(&vendors.join(", "), 60)
+                };
+
+                keyboard_rows.push(vec![
+                    keyword.cell().bold(true),
+                    result.soft_count.cell().justify(Justify::Right),
+                    result.hard_count.cell().justify(Justify::Right),
+                    Self::create_impact_cell(soft_impact),
+                    Self::create_impact_cell(hard_impact),
+                    well_known_str.cell(),
+                ]);
+            }
+
+            let table = keyboard_rows.table().title(vec![
+                "Keyword".cell().bold(true),
+                "Soft".cell().bold(true),
+                "Hard".cell().bold(true),
+                "Soft Impact".cell().bold(true),
+                "Hard Impact".cell().bold(true),
+                "Well-Known Vendors".cell().bold(true),
             ]);
+
+            let _ = print_stdout(table);
         }
 
-        let table = rows.table().title(vec![
-            "Keyword".cell().bold(true),
-            "Soft".cell().bold(true),
-            "Hard".cell().bold(true),
-            "Soft Impact".cell().bold(true),
-            "Hard Impact".cell().bold(true),
-            "Well-Known Vendors".cell().bold(true),
-        ]);
+        if show_labels {
+            if show_keywords {
+                println!();
+            }
 
-        let _ = print_stdout(table);
+            let mut label_data: Vec<_> = self.label_results.iter().collect();
+            if label_data.is_empty() {
+                tracing::info!("No labels match found in the analyzed packages.");
+                return;
+            }
+
+            label_data.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut label_rows = Vec::new();
+            for (label, result) in label_data {
+                let well_known_str = if result.well_known_vendors.is_empty() {
+                    "-".to_string()
+                } else {
+                    let mut vendors: Vec<_> = result
+                        .well_known_vendors
+                        .iter()
+                        .map(|v| v.as_str().trim_end_matches('/'))
+                        .collect();
+                    vendors.sort();
+                    Self::wrap_text(&vendors.join(", "), 60)
+                };
+
+                label_rows.push(vec![
+                    label.cell().bold(true),
+                    result.count.cell().justify(Justify::Right),
+                    well_known_str.cell(),
+                ]);
+            }
+
+            let label_table = label_rows.table().title(vec![
+                "Label".cell().bold(true),
+                "Count".cell().bold(true),
+                "Well-Known Vendors".cell().bold(true),
+            ]);
+
+            let _ = print_stdout(label_table);
+        }
     }
 }

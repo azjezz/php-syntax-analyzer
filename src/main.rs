@@ -24,8 +24,12 @@ mod results;
 #[command(about = "Analyze keyword impact across PHP packages for RFC authors", long_about = None)]
 struct Cli {
     /// Keywords to analyze (can be specified multiple times)
-    #[arg(short, long, required = true)]
+    #[arg(short, long, required = false)]
     keyword: Vec<String>,
+
+    /// Labels to analyze ( goto label, and named arguments )
+    #[arg(short, long, required = false)]
+    label: Vec<String>,
 
     /// Minimum package index (0-based, inclusive)
     #[arg(long, default_value_t = 0)]
@@ -90,8 +94,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    if cli.keyword.is_empty() {
-        anyhow::bail!("At least one keyword must be specified using --keyword");
+    if cli.keyword.is_empty() && cli.label.is_empty() {
+        anyhow::bail!("At least one keyword or label must be specified for analysis");
     }
 
     if cli.min >= cli.max {
@@ -155,8 +159,11 @@ async fn main() -> Result<()> {
         );
     }
 
-    let report =
-        analyze_directory(sources_dir, cli.keyword).context("Failed to analyze directory")?;
+    let has_keywords = !cli.keyword.is_empty();
+    let has_labels = !cli.label.is_empty();
+
+    let report = analyze_directory(sources_dir, cli.keyword, cli.label)
+        .context("Failed to analyze directory")?;
 
     let analysis_duration = analysis_start.elapsed();
     tracing::info!(
@@ -167,7 +174,7 @@ async fn main() -> Result<()> {
     let total_duration = start_time.elapsed();
     tracing::info!("Total time: {:.2}s", total_duration.as_secs_f64());
 
-    report.display_table();
+    report.display_table(has_keywords, has_labels);
 
     Ok(())
 }

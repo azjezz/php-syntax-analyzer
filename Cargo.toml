@@ -9,10 +9,10 @@ bumpalo = "3.19.0"
 clap = { version = "4.5", features = ["derive"] }
 cli-table = "0.5"
 futures = "0.3"
-mago-database = "1.0.0-beta.34"
-mago-names = "1.0.0-beta.34"
-mago-span = "1.0.0-beta.34"
-mago-syntax = "1.0.0-beta.34"
+mago-database = "1.3.0"
+mago-names = "1.3.0"
+mago-span = "1.3.0"
+mago-syntax = "1.3.0"
 rayon = "1.11.0"
 reqwest = { version = "0.12.24", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
